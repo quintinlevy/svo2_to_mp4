@@ -13,19 +13,25 @@ The official Stereolabs export sample writes both cameras side by side into a si
   ```
   pip install opencv-python
   ```
+- [ffmpeg](https://ffmpeg.org/) on the PATH, only for `--quality high` or `lossless`:
+  ```
+  sudo apt install ffmpeg
+  ```
 
 ## Usage
 
 ```
 python svo2_split.py <input.svo2> [--format {mp4,avi}] [--camera {left,right,both}]
+                                  [--quality {normal,high,lossless}]
                                   [--output-dir DIR] [--unrectified]
 ```
 
 | Option | Default | Description |
 |---|---|---|
 | `input` | *(required)* | Path to the `.svo` or `.svo2` file |
-| `--format` | `mp4` | Output container: `mp4` (codec `mp4v`) or `avi` (codec `XVID`) |
+| `--format` | `mp4` | Output container: `mp4` or `avi` |
 | `--camera` | `both` | Which camera(s) to export: `left`, `right`, or `both` |
+| `--quality` | `normal` | Encoding quality, see [Quality](#quality) |
 | `--output-dir` | input file's folder | Where to write the videos (created if missing) |
 | `--unrectified` | off | Export raw sensor images instead of rectified images |
 
@@ -40,7 +46,23 @@ python svo2_split.py recording.svo2 --format avi --camera left
 
 # Right camera, raw images, into a separate folder
 python svo2_split.py recording.svo2 --camera right --output-dir out/ --unrectified
+
+# Both cameras, visually lossless H.264
+python svo2_split.py recording.svo2 --quality high
 ```
+
+### Quality
+
+| `--quality` | `.mp4` | `.avi` | Notes |
+|---|---|---|---|
+| `normal` | `mp4v` (OpenCV) | `XVID` (OpenCV) | No extra dependencies. Visible compression loss. |
+| `high` | H.264, CRF 18 | MPEG-4, `-q:v 2` | Visually lossless. Needs ffmpeg. |
+| `lossless` | H.264, QP 0, 4:4:4 | FFV1, RGB | Very large files. Needs ffmpeg. |
+
+- `lossless` `.avi` (FFV1) is bit-exact. `lossless` `.mp4` loses only tiny rounding from RGB→YUV conversion, and some players can't play 4:4:4 H.264. Use `.avi` if you need exact pixels.
+- If ffmpeg isn't installed, `high` and `lossless` fall back to `normal` with a warning.
+- No setting can be better than the SVO itself. If the recording was made with lossy compression, that loss is already baked in.
+- ffmpeg encodes on the CPU, so `high` and `lossless` are slower, especially on a Jetson.
 
 ### Output
 
@@ -56,10 +78,7 @@ Videos use the recording's original resolution and frame rate. Press Ctrl-C to s
 ## Notes
 
 - Depth computation is disabled during export, so conversion is faster than the Stereolabs sample.
-- `mp4v` output is widely supported but not as efficient as H.264. If you need smaller files, re-encode with ffmpeg:
-  ```
-  ffmpeg -i recording_left.mp4 -c:v libx264 -crf 20 recording_left_h264.mp4
-  ```
+- Rectified images are resampled to correct lens distortion, which softens them very slightly. Use `--unrectified` for the pixels as recorded.
 
 ## License
 
