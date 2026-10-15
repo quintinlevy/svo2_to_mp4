@@ -9,9 +9,11 @@ Examples:
     python svo2_split.py recording.svo2
     python svo2_split.py recording.svo2 --format avi --camera left
     python svo2_split.py recording.svo2 --quality high --output-dir out/ --unrectified
+    python svo2_split.py recording.svo2 --verify full
 """
 
 import argparse
+import json
 import shutil
 import subprocess
 import sys
@@ -42,6 +44,10 @@ VIEWS = {
     "left": (sl.VIEW.LEFT, sl.VIEW.LEFT_UNRECTIFIED),
     "right": (sl.VIEW.RIGHT, sl.VIEW.RIGHT_UNRECTIFIED),
 }
+
+
+class ResolutionMismatch(Exception):
+    """A retrieved frame doesn't match the SVO's resolution."""
 
 
 class FFmpegWriter:
@@ -81,6 +87,71 @@ def open_writer(path, fmt, quality, fps, size):
     return FFmpegWriter(path, fps, size, FFMPEG_ARGS[(fmt, quality)])
 
 
+def probe_header(path):
+    """Return (width, height, frame_count) from the video's container, without decoding.
+
+    frame_count is None if it can't be determined.
+    """
+    if shutil.which("ffprobe"):
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
+             "-show_entries", "stream=width,height,nb_read_packets", "-of", "json", str(path)],
+            capture_output=True, text=True,
+        )
+        streams = json.loads(result.stdout or "{}").get("streams", [])
+        if result.returncode != 0 or not streams:
+            raise RuntimeError(f"ffprobe could not read the file: {result.stderr.strip()}")
+        stream = streams[0]
+        frames = stream.get("nb_read_packets")
+        return int(stream["width"]), int(stream["height"]), int(frames) if frames else None
+
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        raise RuntimeError("OpenCV could not open the file")
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    return width, height, frames if frames > 0 else None
+
+
+def verify_output(path, width, height, expected_frames, mode):
+    """Check an output video's resolution and frame count. Returns True on pass."""
+    expected = f"expected {width}x{height}, {expected_frames} frames"
+    try:
+        if mode == "full":
+            # Decode every frame and check each one's size
+            cap = cv2.VideoCapture(str(path))
+            if not cap.isOpened():
+                raise RuntimeError("OpenCV could not open the file")
+            frames = wrong_size = 0
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                frames += 1
+                if frame.shape[:2] != (height, width):
+                    wrong_size += 1
+            cap.release()
+            passed = wrong_size == 0 and frames == expected_frames
+            found = f"{frames} frames decoded, {wrong_size} with wrong size"
+        else:
+            got_w, got_h, frames = probe_header(path)
+            size_ok = (got_w, got_h) == (width, height)
+            if frames is None:
+                passed = size_ok
+                found = f"{got_w}x{got_h}, frame count unavailable"
+            else:
+                passed = size_ok and frames == expected_frames
+                found = f"{got_w}x{got_h}, {frames} frames"
+    except (RuntimeError, OSError, ValueError, KeyError) as e:
+        passed = False
+        found = f"could not verify ({e})"
+
+    print(f"  {'PASS' if passed else 'FAIL'}  {path.name}: {found} ({expected})")
+    return passed
+
+
 def progress_bar(percent_done, bar_length=40):
     done_length = int(bar_length * percent_done / 100)
     bar = "=" * done_length + "-" * (bar_length - done_length)
@@ -106,6 +177,10 @@ def parse_args():
                         help="Directory for output videos (default: same folder as the input)")
     parser.add_argument("--unrectified", action="store_true",
                         help="Export raw (unrectified) images instead of rectified ones")
+    parser.add_argument("--verify", nargs="?", const="quick", choices=["quick", "full"], default=None,
+                        help="After conversion, check each output's resolution and frame count. "
+                             "quick (default if no value given): read the file header. "
+                             "full: decode every frame (slower).")
     args = parser.parse_args()
 
     if args.input.suffix.lower() not in (".svo", ".svo2"):
@@ -146,6 +221,7 @@ def main():
 
     # One writer and one image buffer per selected camera
     outputs = {}
+    out_paths = []
     for cam in cameras:
         out_path = args.output_dir / f"{args.input.stem}_{cam}.{args.format}"
         try:
@@ -158,11 +234,14 @@ def main():
             return 1
         view = VIEWS[cam][1 if args.unrectified else 0]
         outputs[cam] = (writer, sl.Mat(), view)
+        out_paths.append(out_path)
         print(f"Writing {cam} camera -> {out_path}")
 
     runtime_params = sl.RuntimeParameters()
     print("Converting... press Ctrl-C to stop early.")
 
+    frames_written = 0
+    exit_code = 0
     try:
         while True:
             err = zed.grab(runtime_params)
@@ -174,10 +253,20 @@ def main():
                 print(f"\nStopped on grab error: {err}")
                 break
 
+            # Retrieve and size-check every camera's frame before writing any of them,
+            # so all outputs keep the same frame count
+            frames = []
             for writer, image, view in outputs.values():
                 zed.retrieve_image(image, view)
+                data = image.get_data()
+                if data.shape[:2] != (height, width):
+                    raise ResolutionMismatch(f"frame {frames_written} is {data.shape[1]}x{data.shape[0]}, "
+                                     f"expected {width}x{height}")
                 # ZED images are BGRA; video writers expect BGR
-                writer.write(cv2.cvtColor(image.get_data(), cv2.COLOR_BGRA2BGR))
+                frames.append((writer, cv2.cvtColor(data, cv2.COLOR_BGRA2BGR)))
+            for writer, frame in frames:
+                writer.write(frame)
+            frames_written += 1
 
             if nb_frames > 0:
                 progress_bar(min((zed.get_svo_position() + 1) / nb_frames * 100, 100))
@@ -185,12 +274,24 @@ def main():
         print("\nInterrupted; keeping frames written so far.")
     except BrokenPipeError:
         print("\nffmpeg stopped unexpectedly; see its error output above.")
+        exit_code = 1
+    except ResolutionMismatch as e:
+        print(f"\nResolution mismatch, stopping: {e}")
+        exit_code = 1
     finally:
         for writer, _, _ in outputs.values():
             writer.release()
         zed.close()
 
-    return 0
+    print(f"Frames written per camera: {frames_written} (SVO reports {nb_frames})")
+
+    if args.verify:
+        print(f"Verifying outputs ({args.verify})...")
+        results = [verify_output(p, width, height, frames_written, args.verify) for p in out_paths]
+        if not all(results):
+            exit_code = 1
+
+    return exit_code
 
 
 if __name__ == "__main__":

@@ -24,6 +24,7 @@ The official Stereolabs export sample writes both cameras side by side into a si
 python svo2_split.py <input.svo2> [--format {mp4,avi}] [--camera {left,right,both}]
                                   [--quality {normal,high,lossless}]
                                   [--output-dir DIR] [--unrectified]
+                                  [--verify [{quick,full}]]
 ```
 
 | Option | Default | Description |
@@ -34,6 +35,7 @@ python svo2_split.py <input.svo2> [--format {mp4,avi}] [--camera {left,right,bot
 | `--quality` | `normal` | Encoding quality, see [Quality](#quality) |
 | `--output-dir` | input file's folder | Where to write the videos (created if missing) |
 | `--unrectified` | off | Export raw sensor images instead of rectified images |
+| `--verify` | off | Check the output videos after conversion, see [Verification](#verification) |
 
 ### Examples
 
@@ -49,6 +51,9 @@ python svo2_split.py recording.svo2 --camera right --output-dir out/ --unrectifi
 
 # Both cameras, visually lossless H.264
 python svo2_split.py recording.svo2 --quality high
+
+# Convert, then decode every output frame to confirm resolution and frame count
+python svo2_split.py recording.svo2 --verify full
 ```
 
 ### Quality
@@ -74,6 +79,27 @@ recording_right.mp4
 ```
 
 Videos use the recording's original resolution and frame rate. Press Ctrl-C to stop early; frames written so far are kept.
+
+### Verification
+
+The output videos keep the SVO2 recording's native resolution. The script reads the resolution and frame rate from the ZED SDK, sets up each video writer with exactly those values, and writes frames without resizing or cropping. It checks this in two ways:
+
+- **Every frame, always on:** before writing, each frame's width and height are compared with the SVO's. On a mismatch, the script stops with an error instead of writing a bad frame. This adds no measurable time.
+- **After conversion, with `--verify`:** each output file is checked against the SVO's resolution and the number of frames written.
+
+| Mode | What it checks | Cost |
+|---|---|---|
+| `--verify` or `--verify quick` | Width, height and frame count from the file header (via `ffprobe` if installed, otherwise OpenCV) | Negligible |
+| `--verify full` | Decodes every frame, checking each frame's size and the total count | Roughly 10–30% extra time (estimate) |
+
+Each file gets a `PASS` or `FAIL` line, and the script exits with code 1 if any check fails:
+
+```
+Verifying outputs (full)...
+  PASS  recording_left.mp4: 900 frames decoded, 0 with wrong size (expected 1920x1080, 900 frames)
+```
+
+Why check at all? OpenCV's video writer drops a frame whose size doesn't match without telling the calling program (it only logs a warning), and ffmpeg's raw-video input would misread every frame after a wrong-sized one. In normal use every frame comes from the same SVO at its native size, so these checks confirm correctness rather than catch a known problem.
 
 ## Notes
 
